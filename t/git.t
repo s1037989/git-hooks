@@ -25,7 +25,9 @@ done_testing () {
   fi
 }
 
-export PATH=$CURDIR:${0%/*}:${PATH:+:${PATH}}
+export PATH=$(realpath $(dirname $0)/..):${PATH:+:${PATH}}
+export GIT_AUTHOR_NAME="git hooks" GIT_AUTHOR_EMAIL="git@hook.es"
+export GIT_COMMITTER_NAME=$GIT_AUTHOR_NAME GIT_COMMITTER_EMAIL=$GIT_AUTHOR_EMAIL
 
 unset repo
 which git-hooks &>/dev/null
@@ -41,7 +43,7 @@ origin=$(mktemp -d)
 clone=$(mktemp -d)
 trap "rm -rf $origin $clone" 0
 repo=origin/master && cd $origin
-git init &>/dev/null
+git -c core.symlinks=true init &>/dev/null
 ok "initialize git"
 test -d $origin/.git/hooks
 ok "git hooks directory exists"
@@ -60,7 +62,7 @@ git commit --allow-empty -m "initialize repo with main branch" &>/dev/null
 ok "commit initialize repo with main branch"
 
 unset repo
-git clone $origin $clone &>/dev/null
+git -c core.symlinks=true clone $origin $clone &>/dev/null
 ok "clone origin"
 
 repo=clone/main && cd $clone
@@ -78,6 +80,7 @@ ok "git-hooks directory exists"
 ok "no git-hooks exist"
 git checkout -b add_hooks &>/dev/null
 ok "checkout new branch"
+
 repo=clone/add_hooks
 ln -nsf `which false` $clone/.githooks/pre-commit.d
 git add $clone/.githooks/pre-commit.d/false &>/dev/null
