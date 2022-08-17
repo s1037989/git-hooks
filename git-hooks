@@ -1,19 +1,106 @@
 #!/usr/bin/env bash
 
-HOOKS_DIR=${HOOKS_DIR:-.githooks}
+hooks_dir=.githooks
+bare=0
+[ "$(git config core.bare)" == true ] && bare=1 hooks_dir=hooks
+HOOKS_DIR=${HOOKS_DIR:-$hooks_dir}
 GIT_EDITOR=${GIT_EDITOR:-$(git config --global core.editor)}
 GIT_EDITOR=${GIT_EDITOR:-$EDITOR}
 
-declare -r version=0.01
-declare -a hooks stdin_hooks
+declare -r version=0.01 gitcmd=$(basename $0)
+declare -a hooks server_hooks stdin_hooks
 hooks+=(applypatch-msg pre-applypatch post-applypatch pre-commit prepare-commit-msg)
 hooks+=(commit-msg post-commit pre-rebase post-checkout post-merge pre-receive update)
 hooks+=(post-receive post-update pre-auto-gc post-rewrite pre-push)
 stdin_hooks+=(pre-receive pre-push)
+server_hooks+=(pre-push pre-receive update post-receive post-update push-to-checkout)
+server_hooks+=(pre-auto-gc)
+
+abort() { echo "$*" >&2; exit 1; }
+
+disable_hook () {
+  ! test -x "$1" && return
+  chmod -x "$1"
+  windows && sed -i '1s/^#!/ #!/' "$1"
+  ! test -x "$1"
+}
+
+enable_hook () {
+  test -x "$1" && return
+  chmod +x "$1"
+  windows && sed -i '1s/^.#!/#!/' "$1"
+  test -x "$1"
+}
+
+hooks_dir() {
+  hooks_dir=$(git rev-parse --git-path hooks${1:+/$1}) || abort "can't determine hooks path, try \"git hooks init\""
+  hooks_dir="$(realpath "$hooks_dir")"
+  [ -e "$hooks_dir" ] || abort "can't find hooks path $hooks_dir, try \"git hooks init\""
+}
+
+root_dir() {
+  if [ "$bare" -eq 1 ]; then
+    root_dir="$(git rev-parse --absolute-git-dir)"
+  else
+    root_dir=$(git rev-parse --show-toplevel 2>/dev/null) || abort "not a git repository, try \"git init\""
+  fi
+  windows && root_dir="$(cygpath -u "$root_dir")"
+}
+
+windows() { [ -n "$WINDIR" ]; }
+
+require_symlinks() {
+  git rev-parse --show-toplevel &>/dev/null || return 0
+  if windows; then
+    [ "$(git config core.symlinks)" == "true" ] && return 0
+  else
+    [ "$(git config core.symlinks)" != "false" ] && return 0
+  fi
+  abort "core.symlinks must be explicitly set to true on windows, try \"git config core.symlinks true\""
+}
+
+is_link() {
+  if windows; then
+    fsutil reparsepoint query "$1" > /dev/null
+  else
+    [ -h "$1" ]
+  fi
+}
+
+link() {
+  if [ -n "$WINDIR" ]; then
+    local target="$1" link_name="$(cygpath -w "$2")"
+    if [ -d "$target" ]; then
+      cmd <<< "mklink /D \"$link_name\" \"$target\"" > /dev/null
+    else
+      if [ -d "$link_name" -a -L "$link_name/${target##*/}" ]; then
+        rm "$link_name/${target##*/}"
+      elif [ -L "$link_name" ]; then
+        rm "$link_name"
+      fi
+      cmd <<< "mklink \"$link_name\" \"$target\"" > /dev/null
+    fi
+  else
+    ln -snf "$1" "$2"
+  fi
+}
+
+rmlink() {
+  local target="$1"
+  if windows; then
+    if [[ -d "$target" ]]; then
+      rmdir "$target";
+    else
+      rm "$target"
+    fi
+  else
+    rm "$target"
+  fi
+}
 
 function usage {
 cat <<EOF
-Usage: ${0##*/} <sub-command>
+Usage: $gitcmd <sub-command>
 
   Sub-commands:
     disable <type> <name>
@@ -38,92 +125,126 @@ Usage: ${0##*/} <sub-command>
 EOF
 }
 
-case "${0##*/}:$1" in
-  # disable
-  git-hooks:d*)
-    root_dir=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git repository, try \"git hooks init\""; exit 1; }
-    test -L $root_dir/.git/hooks || { echo "not a ${0##*/} repository, try \"git hooks init\""; exit 1; }
-    hooks_dir=$root_dir/$HOOKS_DIR
-    test -d $hooks_dir/$2.d || exit 1
-    if [ -n "$3" ]; then
-      test -f $hooks_dir/$2.d/$3 && chmod -x $hooks_dir/$2.d/$3 || exit 1
-    else
-      for hook in $hooks_dir/$2.d/*; do chmod -x $hook; done
-    fi
-  ;;
-  # edit
-  git-hooks:ed*)
-    root_dir=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git repository, try \"git hooks init\""; exit 1; }
-    test -L $root_dir/.git/hooks || { echo "not a ${0##*/} repository, try \"git hooks init\""; exit 1; }
-    hooks_dir=$root_dir/$HOOKS_DIR
-    test -d $hooks_dir/$2.d && ${GIT_EDITOR:-vi} $hooks_dir/$2.d/$3
-  ;;
-  # enable
-  git-hooks:en*)
-    root_dir=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git repository, try \"git hooks init\""; exit 1; }
-    test -L $root_dir/.git/hooks || { echo "not a ${0##*/} repository, try \"git hooks init\""; exit 1; }
-    hooks_dir=$root_dir/$HOOKS_DIR
-    test -d $hooks_dir/$2.d || exit 1
-    if [ -n "$3" ]; then
-      test -f $hooks_dir/$2.d/$3 && chmod +x $hooks_dir/$2.d/$3 || exit 1
-    else
-      for hook in $hooks_dir/$2.d/*; do chmod +x $hook; done
-    fi
-  ;;
-  # help
-  git-hooks:h*) usage;;
-  # initialize
-  git-hooks:i*)
-    GIT_TEMPLATE_DIR=$(mktemp -d) git init
-    root_dir=$(git rev-parse --show-toplevel)
-    hooks_dir=$root_dir/$HOOKS_DIR
-    test -d $root_dir/.git/hooks -a ! -L $root_dir/.git/hooks && mv $root_dir/.git/hooks $root_dir/.git/hooks.bak.$(date +%s)
-    ln -snf ../$HOOKS_DIR $root_dir/.git/hooks
-    mkdir -p $hooks_dir
-    for hook in "${hooks[@]}" "${GIT_HOOKS_EXTRA[@]}"; do ln -snf $0 $hooks_dir/$hook; mkdir -p $hooks_dir/$hook.d; done
+case "$gitcmd:$1" in
+  # commit
+  git-hooks:commit)
+    root_dir
+    hooks_dir
+    require_symlinks
     git add $hooks_dir
     git commit -m "initialize git-hooks"
   ;;
+  # disable
+  git-hooks:disable)
+    root_dir
+    hooks_dir
+    require_symlinks
+    test -d $hooks_dir/$2.d || exit 1
+    if [ -n "$3" ]; then
+      hook="$hooks_dir/$2.d/$3"
+      disable_hook $hook
+    else
+      for hook in $hooks_dir/$2.d/*; do disable_hook $hook; done
+    fi
+  ;;
+  # edit
+  git-hooks:edit)
+    root_dir
+    hooks_dir
+    require_symlinks
+    test -d $hooks_dir/$2.d && ${GIT_EDITOR:-vi} $hooks_dir/$2.d/$3
+  ;;
+  # enable
+  git-hooks:enable)
+    root_dir
+    hooks_dir
+    require_symlinks
+    test -d $hooks_dir/$2.d || exit 1
+    if [ -n "$3" ]; then
+      hook="$hooks_dir/$2.d/$3"
+      enable_hook $hook
+    else
+      for hook in $hooks_dir/$2.d/*; do enable_hook $hook; done
+    fi
+  ;;
+  # help
+  git-hooks:help) usage;;
+  # initialize
+  git-hooks:init)
+    root_dir
+    old_hooks_dir=$(git rev-parse --git-path hooks)
+    git config core.hookspath $HOOKS_DIR
+    new_hooks_dir=$(git rev-parse --git-path hooks)
+    [ "$old_hooks_dir" == "$new_hooks_dir" ] || printf "changed hooks path from %s to %s\n" "$old_hooks_dir" "$new_hooks_dir"
+    hooks_dir="$new_hooks_dir"
+    require_symlinks
+    unset reinit
+    test -e $hooks_dir && reinit="Re-"
+    mkdir -p $hooks_dir
+    hooks_dir
+    for hook in "${hooks[@]}" "${GIT_HOOKS_EXTRA[@]}"; do
+      mkdir -p $hooks_dir/$hook.d
+      test -L $hooks_dir/$hook || mv $hooks_dir/$hook $hooks_dir/$hooks.d/$hook
+      link $0 $hooks_dir/$hook
+    done
+    printf "%sinitialized git-hooks Git repository in %s/\n" "$reinit" "$hooks_dir"
+    unset reinit
+  ;;
   # list
-  git-hooks:l*)
+  git-hooks:list)
     shopt -s nullglob
-    root_dir=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git repository, try \"git hooks init\""; exit 1; }
-    test -L $root_dir/.git/hooks || { echo "not a ${0##*/} repository, try \"git hooks init\""; exit 1; }
-    hooks_dir=$root_dir/$HOOKS_DIR
-    for hook in $hooks_dir/*.d/*; do
+    root_dir
+    hooks_dir
+    require_symlinks
+    if [ -n "$1" -a -n "$2" ]; then
+      hook="$hooks_dir/$1.d/$2"
       dummy="${hook//$hooks_dir/}"
       type="${dummy%/*}"
       name="${dummy##*/}"
-      test -x "$hook"
-      printf "%-15s %-15s %s\n" "${type:1:-2}" "$name" "$?"
-    done
+      test -x "$hook" && dummy=enabled || dummy=disabled
+      printf "%-15s %-15s %s\n" "${type:1:-2}" "$name" "$dummy"
+    else
+      for hook in $hooks_dir/*.d/*; do
+        dummy="${hook//$hooks_dir/}"
+        type="${dummy%/*}"
+        name="${dummy##*/}"
+        test -x "$hook" && dummy=enabled || dummy=disabled
+        printf "%-15s %-15s %s\n" "${type:1:-2}" "$name" "$dummy"
+      done
+    fi
   ;;
   # version
-  git-hooks:v*)
+  git-hooks:version)
     echo $version
   ;;
+  # invalid no cmd
+  git-hooks:|git-hooks:*) echo "Usage: git hooks <cmd> [OPTIONS]"; exit 1;;
   # hooks
   *)
-    grep -qF ${0##*/} <(printf "%s\n" "${hooks[@]}" "${EXTRA_HOOKS[@]}") || { echo "not a git hook"; exit 1; }
-    root_dir=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git repository, try \"git hooks init\""; exit 1; }
+    echo "Running $gitcmd $@" >&2
+    grep -qF $gitcmd <(printf "%s\n" "${hooks[@]}" "${EXTRA_HOOKS[@]}") || abort "not a git hook"
+    root_dir
     root_dir=${root_dir//\/.git/}
-    test -L $root_dir/.git/hooks || { echo "not a git-hooks repository, try \"git hooks init\""; exit 1; }
-    hooks_dir=$root_dir/$HOOKS_DIR
+    hooks_dir
+    require_symlinks
     [ -n "$DISABLE_ALL_HOOKS" ] && exit 0
-    grep -qF ${0##*/} <(printf "%s\n" "${DISABLE_HOOKS[@]}") && exit 0
-    declare -a stdin
-    grep -qF ${0##*/} <(printf "%s\n" "${stdin_hooks[@]}" "${EXTRA_STDIN_HOOKS[@]}") && while read -t .1; do stdin+=($REPLY); done < <(</dev/stdin)
-    test -d $hooks_dir/${0##*/}.d && for hook in $hooks_dir/${0##*/}.d/*; do
+    grep -qF $gitcmd <(printf "%s\n" "${DISABLE_HOOKS[@]}") && exit 0
+    stdin=$(mktemp -q --suffix=.githooks)
+    grep -qF $gitcmd <(printf "%s\n" "${stdin_hooks[@]}" "${EXTRA_STDIN_HOOKS[@]}") && timeout .1 cat > $stdin
+    test -d $hooks_dir/$gitcmd.d && for hook in $hooks_dir/$gitcmd.d/*; do
       test -x "$hook" || continue
-      echo "Running ${0##*/} ${hook##*/} hook" >&2
-      case "${#stdin[@]}" in
-        0) $hook "$@";;
-        *) printf "%s\n" "${stdin[@]}" | $hook "$@";;
-      esac
+      echo "Running $gitcmd ${hook##*/} hook" >&2
+      if test -s $stdin; then
+        $hook "$@" < $stdin
+      else
+        $hook "$@"
+      fi
       err=$?
       echo
       (($err)) && exit $err
     done
-    echo "No more ${0##*/} hooks" >&2
+    rm -f "$stdin"
+    echo "No more $gitcmd hooks" >&2
   ;;
 esac
+
